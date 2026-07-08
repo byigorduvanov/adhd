@@ -357,6 +357,35 @@ def focus_vscode_window(root, project):
     return "`code` CLI failed to run"
 
 
+def focus_vscode_session(s):
+    """Focus the exact VS Code terminal *tab* running session `s` (Windows).
+
+    A Claude session is an integrated-terminal tab, not a window, so two moves:
+      1. raise the VS Code window hosting the session's claude process — this
+         also makes it the topmost window, which is the one VS Code routes the
+         next step to in a multi-window setup; then
+      2. hand VS Code `vscode://adhd.focus/term?shellPid=<pid>` so the companion
+         extension reveals the tab whose shell is <pid>. That shell is the
+         parent of the claude process — exactly what Terminal.processId reports.
+
+    Degrades honestly: window-only when the extension is absent/not-yet-loaded,
+    then folder-based focus when no pid was captured (restart the session).
+    """
+    term = s.get("term") or {}
+    proj = s.get("project") or "session"
+    cpid = term.get("claude_pid") or 0
+    raised = bool(cpid) and winplat.focus_pid(cpid)
+    shell = winplat.parent_pid(cpid) if cpid else 0
+    if shell and winplat.vscode_focus_ext_installed():
+        if winplat.open_uri("vscode://adhd.focus/term?shellPid=%d" % shell):
+            return "focused %s terminal" % proj
+    if raised:
+        return ("raised the VS Code window for %s — install the adhd.focus "
+                "extension and reload VS Code to land on the exact tab" % proj)
+    root = term.get("root") or s.get("cwd") or ""
+    return focus_vscode_window(root, s.get("project") or "")
+
+
 def focus_session(s):
     """Bring the terminal window/pane running session `s` to the front.
 
@@ -372,10 +401,13 @@ def focus_session(s):
     app = APP_NAME.get(prog)
 
     if IS_WIN:
-        # VS Code first — the `code` CLI targets the exact window by folder.
+        # VS Code: raise the window hosting this session's claude process, then
+        # switch to its exact terminal tab via the adhd.focus extension. Beats
+        # `code <folder>`, which only knows the folder — useless when many
+        # sessions share one window (and it can even spawn a stray new window
+        # for a terminal cd'd outside the workspace root).
         if prog == "vscode":
-            root = term.get("root") or s.get("cwd") or ""
-            return focus_vscode_window(root, s.get("project") or "")
+            return focus_vscode_session(s)
         # Everything else: raise the terminal window hosting the claude process
         # (classic console directly; Windows Terminal via its top-level window —
         # right window, though not necessarily the right tab).

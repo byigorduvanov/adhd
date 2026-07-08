@@ -14,6 +14,7 @@ Run it from wherever you cloned the repo:
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -24,6 +25,7 @@ HOOK = os.path.join(REPO, "hook.py")
 MONITOR = os.path.join(REPO, "monitor.py")
 MENUBAR = os.path.join(REPO, "menubar.py")   # macOS menu bar (rumps)
 TRAYBAR = os.path.join(REPO, "traybar.py")   # Windows tray (pystray)
+VSCODE_EXT = os.path.join(REPO, "vscode-extension")  # adhd.focus (Windows)
 SETTINGS = os.path.expanduser("~/.claude/settings.json")
 LAUNCH_AGENT = os.path.expanduser(
     "~/Library/LaunchAgents/com.adhd.menubar.plist")
@@ -220,6 +222,34 @@ def _hook_command():
     return "python3 %s" % shlex.quote(HOOK)
 
 
+def install_vscode_extension():
+    """Sideload the adhd.focus extension into ~/.vscode/extensions (Windows).
+
+    A toast click can only switch to a specific VS Code terminal *tab* through
+    VS Code's own URI handler — the one this extension registers. Copy it to
+    ~/.vscode/extensions/adhd.focus-<version>/ (the folder layout VS Code loads
+    a sideloaded extension from); VS Code picks it up on the next window reload.
+    Returns the destination path, or "" if the source is missing / copy failed.
+    """
+    pkg = os.path.join(VSCODE_EXT, "package.json")
+    if not os.path.exists(pkg):
+        return ""
+    try:
+        with open(pkg, encoding="utf-8") as f:
+            ver = json.load(f).get("version", "0.0.0")
+    except (OSError, ValueError):
+        ver = "0.0.0"
+    dst = os.path.join(os.path.expanduser("~"), ".vscode", "extensions",
+                       "adhd.focus-%s" % ver)
+    try:
+        if os.path.isdir(dst):
+            shutil.rmtree(dst, ignore_errors=True)
+        shutil.copytree(VSCODE_EXT, dst)
+        return dst
+    except OSError:
+        return ""
+
+
 def install_hooks():
     os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
     cfg = {}
@@ -248,6 +278,7 @@ def main():
     target, menu, bin_dir, on_path = install_command()
     install_hooks()
     have_deps = ensure_deps()
+    vsext = install_vscode_extension() if IS_WIN else ""
 
     deps_hint = ("pip install " + " ".join(DEPS_WIN)) if IS_WIN \
         else "pip3 install --user rumps"
@@ -258,6 +289,10 @@ def main():
     print("  monitor   : %s" % MONITOR)
     print("  deps      : %s" % ("ready" if have_deps
                                 else "MISSING — run: " + deps_hint))
+    if IS_WIN:
+        print("  vscode ext: %s" % (vsext + "  (run 'Developer: Reload Window'"
+              " in VS Code once to load it)" if vsext
+              else "skipped (vscode-extension/ not found)"))
 
     if want_login:
         where = install_login_item()

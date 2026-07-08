@@ -154,6 +154,22 @@ def proc_cmdline(pid):
         return ""
 
 
+def parent_pid(pid):
+    """The parent pid of `pid`, or 0.
+
+    For a session's `claude` process this is the shell that launched it — the
+    exact pid VS Code reports as its integrated terminal's `Terminal.processId`,
+    which is how the adhd.focus extension matches a toast to a terminal tab.
+    """
+    ps = _psutil()
+    if not ps:
+        return 0
+    try:
+        return int(ps.Process(int(pid)).ppid())
+    except Exception:
+        return 0
+
+
 def _console_python():
     """Path to python.exe even when we run under pythonw.exe (for helpers)."""
     exe = sys.executable or "python"
@@ -192,6 +208,48 @@ def send_to_pid(pid, text):
         return False
     payload = base64.b64encode(str(text).encode("utf-8")).decode("ascii")
     return _helper("send", pid, payload)
+
+
+def open_uri(uri):
+    """ShellExecute a URL exactly as a toast click / shell would. True on success.
+
+    Used to hand a `vscode://adhd.focus/...` URL to VS Code's own URL handler so
+    it can reveal a specific integrated-terminal tab — the one thing no Win32
+    window call can do, since terminals aren't OS windows. No console required,
+    so it runs straight from the tray/dashboard process.
+    """
+    if not IS_WIN:
+        return False
+    try:
+        SW_SHOWNORMAL = 1
+        shell32 = ctypes.windll.shell32
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        rc = shell32.ShellExecuteW(None, "open", str(uri), None, None, SW_SHOWNORMAL)
+        # ShellExecuteW returns an HINSTANCE > 32 on success; <= 32 is an error
+        # code, and c_void_p maps a 0 return to None.
+        return rc is not None and int(rc) > 32
+    except Exception:
+        return False
+
+
+def vscode_focus_ext_installed():
+    """True if the adhd.focus VS Code extension is present in ~/.vscode/extensions.
+
+    Guards firing the vscode:// URL so a machine without the extension doesn't
+    get VS Code's 'no handler' notification. Presence isn't proof it's loaded —
+    VS Code needs one window reload after a fresh copy — but it keeps the URL
+    from firing where the extension was never installed at all.
+    """
+    if not IS_WIN:
+        return False
+    try:
+        ext = os.path.join(os.path.expanduser("~"), ".vscode", "extensions")
+        for name in os.listdir(ext):
+            if name.startswith("adhd.focus-"):
+                return True
+    except OSError:
+        pass
+    return False
 
 
 # ---------------------------------------------------------------------------
