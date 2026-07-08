@@ -11,16 +11,30 @@ Keys:  ↑/↓ (or j/k) select   ⏎ focus a session / open a closed project
           terminals that report modifier keys — not Terminal.app)
        c clear stale   q quit
 """
-import curses
 import glob
 import json
 import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
-from history import load_history, record_closed
+try:
+    import curses
+except ImportError:  # Windows ships no curses; the installer adds the shim.
+    # Don't exit here: traybar.py/menubar.py import this module purely for the
+    # data layer (load/focus), which needs no curses — only the dashboard
+    # entry point below actually requires it.
+    curses = None
+
+import winplat
+from history import load_history, project_name, record_closed
+from winplat import IS_WIN, NOWIN
+
+CURSES_HINT = ("adhd needs the 'windows-curses' package on Windows:\n"
+               "    pip install windows-curses\n"
+               "(install.py installs it for you.)\n")
 
 STATE_DIR = os.environ.get("ADHD_STATE_DIR") or os.path.join(
     os.path.expanduser("~"), ".adhd", "state")
@@ -63,7 +77,7 @@ def live_ttys():
     """
     try:
         out = subprocess.run(["ps", "-axo", "tty=,comm="],
-                             stdout=subprocess.PIPE, text=True).stdout
+                             stdout=subprocess.PIPE, text=True, **NOWIN).stdout
     except Exception:
         return None
     ttys = set()
@@ -89,6 +103,9 @@ def boot_time():
     global _BOOT_TIME
     if _BOOT_TIME is None:
         _BOOT_TIME = 0.0
+        if IS_WIN:
+            _BOOT_TIME = winplat.boot_time()
+            return _BOOT_TIME
         try:
             # macOS: "{ sec = 1718000000, usec = 0 } Tue Jun ..."
             out = subprocess.check_output(
@@ -118,9 +135,17 @@ def load_sessions():
     # Crashed/force-closed sessions never send SessionEnd, so they'd linger
     # forever showing their last state (often a red WAITING). Drop any whose
     # terminal no longer has a live claude, or that predates the last reboot,
-    # recording each to history on the way out. Skip the live-tty prune if we
-    # can't read the process list, or a record has no captured tty.
-    live = live_ttys()
+    # recording each to history on the way out. Skip the live prune if we
+    # can't read the process list, or a record has no captured tty/pid.
+    # macOS anchors a session by its tty; Windows by the claude process's pid
+    # (+ creation time, so a recycled pid can't impersonate a dead session).
+    # snap_t is taken BEFORE the process snapshot: a state file written after
+    # it may belong to a claude the snapshot missed (psutil freezes its pid set
+    # up front, and a cold first enumeration takes seconds), so such records
+    # get a pass this tick and are re-judged against the next, warmer snapshot.
+    live = None if IS_WIN else live_ttys()
+    snap_t = time.time()
+    live_pids = winplat.live_claude_procs() if IS_WIN else None
     boot = boot_time()
     out = []
     for fp in glob.glob(os.path.join(STATE_DIR, "*.json")):
@@ -133,6 +158,17 @@ def load_sessions():
         # now belong to a different session, so reap outright rather than trust it.
         if boot and r.get("updated", 0) < boot:
             _reap(fp, r)
+            continue
+        if IS_WIN:
+            cpid = (r.get("term") or {}).get("claude_pid") or 0
+            if live_pids is not None and cpid and r.get("updated", 0) < snap_t - 1.0:
+                created = live_pids.get(cpid)
+                recorded = (r.get("term") or {}).get("claude_create") or 0.0
+                # Gone, or the pid now belongs to a younger process: reap.
+                if created is None or (recorded and abs(created - recorded) > 2.0):
+                    _reap(fp, r)
+                    continue
+            out.append(r)
             continue
         tty = (r.get("term", {}).get("tty") or "").replace("/dev/", "")
         if live and tty and tty not in live:
@@ -168,7 +204,8 @@ def _run(cmd):
     """Run a command silently; return True on exit 0."""
     try:
         return subprocess.run(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            **NOWIN).returncode == 0
     except Exception:
         return False
 
@@ -215,7 +252,7 @@ def open_project(entry, resume=False):
     Returns a short status string for the footer.
     """
     root = entry.get("root") or entry.get("cwd") or ""
-    proj = entry.get("project") or (os.path.basename(root.rstrip("/")) if root else "?")
+    proj = entry.get("project") or (project_name(root) if root else "?")
     if not root or not os.path.isdir(root):
         return "can't re-open %s — folder is gone" % proj
 
@@ -224,6 +261,9 @@ def open_project(entry, resume=False):
     # window and let the user resume claude there (its persisted state is intact).
     if entry.get("term_program") == "vscode":
         return focus_vscode_window(root, proj)
+
+    if IS_WIN:
+        return _open_project_win(entry, root, proj, resume)
 
     claude = shutil.which("claude") or "claude"
     sid = entry.get("session_id") or ""
@@ -257,6 +297,39 @@ def open_project(entry, resume=False):
     return status if ok else "couldn't re-open %s" % proj
 
 
+def _open_project_win(entry, root, proj, resume):
+    """Windows re-open: a fresh console window in `root` running claude.
+
+    Prefers Windows Terminal (`wt -d`) when installed, else a classic console
+    via `cmd /c start`. The command is passed as separate argv items — never a
+    nested quoted string — so paths with spaces survive cmd.exe's parsing. The
+    window closes when claude exits, same as the macOS `exec claude` behavior.
+    """
+    claude = shutil.which("claude") or "claude"
+    sid = entry.get("session_id") or ""
+    if resume and _session_exists(sid):
+        args, status = [claude, "--resume", sid], "resuming %s…" % proj
+    elif resume:
+        args, status = [claude, "--continue"], "resuming %s… (latest)" % proj
+    else:
+        args, status = [claude], "opening %s…" % proj
+    wt = shutil.which("wt")
+    if wt:
+        # `;` is wt's subcommand separator and must be escaped inside args.
+        ok = _run([wt, "-d", root.replace(";", "\\;")] + args)
+    else:
+        # Hand cmd.exe a pre-quoted command line rather than a list:
+        # list2cmdline only quotes args containing whitespace, so a root like
+        # C:\dev\R&D would otherwise reach cmd unquoted and split at the `&`.
+        # (`"` is not legal in Windows paths, so plain wrapping is safe.)
+        # `start` treats its first quoted argument as the window title, so the
+        # title must be passed explicitly or a quoted claude path would eat it.
+        ok = _run('cmd /c start "adhd — %s" /D "%s" %s'
+                  % (proj.replace('"', ""), root,
+                     " ".join('"%s"' % a for a in args)))
+    return status if ok else "couldn't re-open %s" % proj
+
+
 def focus_vscode_window(root, project):
     """Focus the VS Code window that has `root` open, via the `code` CLI.
 
@@ -267,6 +340,15 @@ def focus_vscode_window(root, project):
     """
     if not root:
         return "no folder recorded for this session (restart it)"
+    if IS_WIN:
+        # `code` is a .cmd shim on Windows; run it through cmd.exe. Quote the
+        # root ourselves — list2cmdline wouldn't, and an unquoted `&` in the
+        # path would both open the wrong folder and run the rest as a command.
+        if not shutil.which("code"):
+            return "`code` CLI not found (install it from VS Code: Shell Command)"
+        if _run('cmd /c code "%s"' % root):
+            return "focused VS Code: %s" % (project or root)
+        return "`code` CLI failed to run"
     code = shutil.which("code") or "/usr/local/bin/code"
     if not os.path.exists(code):
         return "`code` CLI not found (install it from VS Code: Shell Command)"
@@ -288,6 +370,21 @@ def focus_session(s):
     iterm = term.get("iterm_session_id", "")
     tty = term.get("tty", "")
     app = APP_NAME.get(prog)
+
+    if IS_WIN:
+        # VS Code first — the `code` CLI targets the exact window by folder.
+        if prog == "vscode":
+            root = term.get("root") or s.get("cwd") or ""
+            return focus_vscode_window(root, s.get("project") or "")
+        # Everything else: raise the terminal window hosting the claude process
+        # (classic console directly; Windows Terminal via its top-level window —
+        # right window, though not necessarily the right tab).
+        cpid = term.get("claude_pid") or 0
+        if cpid and winplat.focus_pid(cpid):
+            return "focused window of %s" % (s.get("project") or "session")
+        if cpid:
+            return "couldn't raise the window (session on pid %s)" % cpid
+        return "no window info for this session (restart it to capture)"
 
     # 1) tmux: select the window+pane, then raise whatever app hosts tmux.
     if pane:
@@ -364,6 +461,13 @@ def send_text_to_session(s, text):
     pane = term.get("tmux_pane", "")
     iterm = term.get("iterm_session_id", "")
     tty = term.get("tty", "")
+
+    # Windows: write into the claude process's own console input buffer
+    # (WriteConsoleInput). This targets the process, not a window, so it can
+    # never land in the wrong app — which also makes VS Code sessions safe to
+    # nudge here, unlike on macOS where their terminal isn't scriptable.
+    if IS_WIN:
+        return winplat.send_to_pid(term.get("claude_pid") or 0, text)
 
     # tmux: send the literal text to the pane, then Enter to submit it.
     if pane:
@@ -511,7 +615,14 @@ def _activate(key, sessions, history, resume=False):
 
 
 def _pid_alive(pid):
-    """True if a process with this pid exists (even if it isn't ours to signal)."""
+    """True if a process with this pid exists (even if it isn't ours to signal).
+
+    Windows must go through winplat: os.kill(pid, 0) is not a probe there —
+    any signal besides CTRL_C/CTRL_BREAK unconditionally TERMINATES the target,
+    which here would mean killing the running dashboard we're checking for.
+    """
+    if IS_WIN:
+        return winplat.pid_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -530,6 +641,9 @@ def _is_monitor_proc(pid):
     spawning a duplicate — the worst case is focus_session() raising the wrong
     window, which is far less annoying than a pile of stray monitors.
     """
+    if IS_WIN:
+        out = winplat.proc_cmdline(pid)
+        return "monitor.py" in out if out else True
     try:
         out = subprocess.check_output(
             ["ps", "-o", "command=", "-p", str(pid)],
@@ -543,8 +657,11 @@ def _own_tty():
     """This dashboard's controlling terminal (e.g. /dev/ttys003), or ''.
 
     Unlike the hook — whose stdio Claude Code pipes — the dashboard owns a real
-    terminal, so os.ttyname works directly.
+    terminal, so os.ttyname works directly. Windows has no ttys (and no
+    os.ttyname); the lock's pid is the anchor there instead.
     """
+    if IS_WIN:
+        return ""
     for fd in (0, 1, 2):
         try:
             return os.ttyname(fd)
@@ -562,16 +679,18 @@ def write_dashboard_lock():
     """
     try:
         os.makedirs(ADHD_HOME, exist_ok=True)
+        term = {
+            "term_program": os.environ.get("TERM_PROGRAM", ""),
+            "tmux_pane": os.environ.get("TMUX_PANE", ""),
+            "iterm_session_id": os.environ.get("ITERM_SESSION_ID", ""),
+            "tty": _own_tty(),
+        }
+        if IS_WIN:
+            # The dashboard is itself a console process, so the same pid-based
+            # focus path used for claude sessions can raise its window.
+            term["claude_pid"] = os.getpid()
         with open(DASHBOARD_LOCK, "w") as f:
-            json.dump({
-                "pid": os.getpid(),
-                "term": {
-                    "term_program": os.environ.get("TERM_PROGRAM", ""),
-                    "tmux_pane": os.environ.get("TMUX_PANE", ""),
-                    "iterm_session_id": os.environ.get("ITERM_SESSION_ID", ""),
-                    "tty": _own_tty(),
-                },
-            }, f)
+            json.dump({"pid": os.getpid(), "term": term}, f)
     except OSError:
         pass
 
@@ -698,6 +817,10 @@ def main(stdscr):
 
 
 if __name__ == "__main__":
+    if curses is None:
+        # pythonw has no stderr; fall back so the write can't mask the message.
+        (sys.stderr or sys.stdout or open(os.devnull, "w")).write(CURSES_HINT)
+        raise SystemExit(1)
     # Single-instance backstop: if a dashboard is already running, raise its
     # window and bow out instead of stacking a second curses view. This holds no
     # matter how we're launched — the menu bar, the `adhd` command, or a bare

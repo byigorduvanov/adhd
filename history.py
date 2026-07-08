@@ -22,6 +22,17 @@ ADHD_HOME = os.environ.get("ADHD_HOME") or os.path.join(
 HISTORY_FILE = os.path.join(ADHD_HOME, "history.json")
 MAX_HISTORY = 10
 
+# Separators to trim off a root path before taking its basename. Backslash is
+# only a separator on Windows — on macOS it's a legal filename character, so
+# stripping it there would rename a (weird but real) project.
+_SEPS = "/\\" if os.name == "nt" else "/"
+
+
+def project_name(root):
+    """Display name for a project root: its basename, tolerant of trailing
+    separators. Shared by hook.py, monitor.py, and record_closed below."""
+    return os.path.basename(root.rstrip(_SEPS)) or root
+
 
 def load_history():
     """Return the recently-closed projects, newest first (empty list on any error)."""
@@ -49,8 +60,7 @@ def record_closed(session):
     if not root:
         return
     entry = {
-        "project": session.get("project")
-        or os.path.basename(root.rstrip("/")) or root,
+        "project": session.get("project") or project_name(root),
         "root": root,
         "cwd": session.get("cwd") or root,
         "term_program": term.get("term_program", ""),

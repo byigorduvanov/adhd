@@ -13,7 +13,8 @@ import sys
 import time
 import tempfile
 
-from history import record_closed
+from history import project_name, record_closed
+from winplat import IS_WIN, NOWIN, find_claude_ancestor
 
 STATE_DIR = os.environ.get("ADHD_STATE_DIR") or os.path.join(
     os.path.expanduser("~"), ".adhd", "state")
@@ -24,7 +25,11 @@ def detect_tty():
 
     The hook's stdin/stdout are piped by Claude Code, so os.ttyname usually
     fails; fall back to asking ps for the tty of our parent (the claude proc).
+    Windows has no ttys at all — sessions are anchored by the claude process's
+    pid instead (see detect_terminal).
     """
+    if IS_WIN:
+        return ""
     for fd in (2, 1, 0):
         try:
             return os.ttyname(fd)
@@ -50,7 +55,7 @@ def detect_root(cwd):
     try:
         out = subprocess.check_output(
             ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
-            stderr=subprocess.DEVNULL, text=True).strip()
+            stderr=subprocess.DEVNULL, text=True, **NOWIN).strip()
         if out:
             return out
     except Exception:
@@ -59,14 +64,28 @@ def detect_root(cwd):
 
 
 def detect_terminal(cwd):
-    """Identifiers the dashboard uses to focus this session's window later."""
-    return {
+    """Identifiers the dashboard uses to focus this session's window later.
+
+    On Windows the anchor is the claude process itself: the hook is a
+    descendant of the claude that spawned it, so the nearest claude ancestor's
+    pid (+ creation time, guarding pid reuse) identifies this session for
+    reaping, window focus, and auto-resume. TERM_PROGRAM still marks VS Code
+    (it sets the var on every platform); WT_SESSION marks Windows Terminal.
+    """
+    term = {
         "term_program": os.environ.get("TERM_PROGRAM", ""),
         "tmux_pane": os.environ.get("TMUX_PANE", ""),
         "iterm_session_id": os.environ.get("ITERM_SESSION_ID", ""),
         "tty": detect_tty(),
         "root": detect_root(cwd),
     }
+    if IS_WIN:
+        anc = find_claude_ancestor()
+        term["claude_pid"] = anc.get("pid", 0)
+        term["claude_create"] = anc.get("create", 0.0)
+        if not term["term_program"] and os.environ.get("WT_SESSION"):
+            term["term_program"] = "WindowsTerminal"
+    return term
 
 
 def read_title(transcript_path, fallback=""):
@@ -184,14 +203,25 @@ def main():
     term = prev.get("term")
     if not term:
         term = detect_terminal(cwd)
-    elif not term.get("root"):
-        term["root"] = detect_root(cwd)  # backfill for pre-existing sessions
+    else:
+        if not term.get("root"):
+            term["root"] = detect_root(cwd)  # backfill for pre-existing sessions
+        # Windows: re-anchor the claude pid when a NEW claude process reports
+        # under an old sid (`--resume` reuses the session id, so the cached pid
+        # points at the dead predecessor), and keep retrying a capture that
+        # failed on the first event (e.g. psutil not importable yet) — a stale
+        # or zero pid makes the session unfocusable and mis-reapable.
+        if IS_WIN and (event == "SessionStart" or not term.get("claude_pid")):
+            anc = find_claude_ancestor()
+            if anc:
+                term["claude_pid"] = anc["pid"]
+                term["claude_create"] = anc.get("create", 0.0)
 
     root = term.get("root") or cwd
     record = {
         "session_id": sid,
         "cwd": cwd,
-        "project": os.path.basename(root.rstrip("/")) or root,
+        "project": project_name(root),
         # The chat's Claude-generated title, so the dashboard and menu bar can
         # show WHAT a session is about, not just which folder it's in. Falls back
         # to the previous title when this event's transcript tail has none.

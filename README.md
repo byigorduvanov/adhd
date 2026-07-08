@@ -3,19 +3,30 @@
 A live terminal dashboard that shows every running Claude Code instance and its
 state, so you don't have to switch between projects to find the one stuck on a
 `yes / don't ask again` permission prompt. Select a session and hit Enter to jump
-straight to its window.
+straight to its window. Runs on macOS and Windows.
 
 ![The adhd dashboard listing running Claude Code sessions by state](docs/monitor.png)
 
 ## Install
 
+macOS:
+
 ```bash
-git clone https://github.com/serjou1/adhd.git ~/.claude/adhd
+git clone https://github.com/byigorduvanov/adhd.git ~/.claude/adhd
 python3 ~/.claude/adhd/install.py
 ```
 
-The installer drops an `adhd` command on your PATH and wires the Claude Code
-hooks. (The repo is private — `git clone` uses your existing GitHub credentials.)
+Windows (PowerShell or cmd):
+
+```powershell
+git clone https://github.com/byigorduvanov/adhd.git "$env:USERPROFILE\.claude\adhd"
+python "$env:USERPROFILE\.claude\adhd\install.py"
+```
+
+The installer drops an `adhd` command on your PATH, wires the Claude Code
+hooks, and installs the platform's dependencies (`rumps` on macOS;
+`psutil pystray Pillow winotify windows-curses` on Windows). (The repo is
+private — `git clone` uses your existing GitHub credentials.)
 
 ## Quick start
 
@@ -26,6 +37,41 @@ adhd
 That's it. It refreshes every second and picks up every Claude Code session
 automatically. No setup per project. Runtime state lives in `~/.adhd/state`
 (override with `ADHD_STATE_DIR`).
+
+## Windows
+
+The same monitor, tray badge, and notifications — with Windows mechanisms under
+the hood. `adhd` opens the dashboard (curses via `windows-curses`); `adhd-menu`
+starts a **system-tray icon** whose badge counts the sessions WAITING on a
+permission prompt, colored by the most urgent state (red waiting · purple
+rate-limited · yellow working · green idle). Right-click it for the live session
+menu with the same toggles as macOS; double-click opens the dashboard.
+
+While the tray app runs it pops **toast notifications** on the transitions that
+matter — the same table as macOS below: ✅ *project* — done when a turn
+finishes, 🔴 *project* needs you on a permission prompt (with 10-minute repeat
+reminders), 🟣 rate-limited. Toasts also land in the Action Center, so a banner
+you missed isn't gone. **Clicking a toast focuses the waiting session's
+window** — toasts launch the per-user `adhd:` URL protocol (registered in HKCU
+on tray startup), which is the Windows analogue of the macOS notifier applet.
+
+Where macOS anchors a session to its tty, Windows anchors it to the **claude
+process itself**: the hook records the claude pid (+ creation time, so a
+recycled pid can't impersonate a dead session), the dashboard reaps sessions
+whose process is gone, and jumping to a session raises the window that hosts
+that pid — a classic console directly, Windows Terminal via its top-level
+window (right window; Windows exposes no API to pick the exact tab), VS Code
+through `code <project-root>` exactly like macOS.
+
+**Auto-resume** on Windows types via `WriteConsoleInput` into the claude
+process's *own console input buffer* — it targets the process, not a window, so
+the nudge can never land in the wrong app, works without stealing focus, and
+(unlike macOS) safely covers VS Code sessions too. Same opt-in toggle, same
+`ADHD_*` variables, same `~/.adhd/config.json`.
+
+`python install.py --login` auto-starts the tray app at sign-in via an
+`HKCU\...\Run` registry value (per-user, no admin; delete the `adhd-menu` value
+to undo).
 
 ## Menu bar (macOS)
 
@@ -253,10 +299,12 @@ Event → state mapping (in `hook.py`):
 
 | Path | Role |
 |------|------|
-| `install.py`              | One-shot installer: adds the `adhd` / `adhd-menu` commands, wires the hooks, installs `rumps` (`--login` adds a LaunchAgent). |
+| `install.py`              | One-shot installer: adds the `adhd` / `adhd-menu` commands, wires the hooks, installs the platform deps (`--login` adds a LaunchAgent / Run key). |
 | `hook.py`                 | Event handler; writes per-session state, records closes to history. Always exits 0 so it can't break a session. |
 | `monitor.py`              | The terminal dashboard (also the shared session-loading / window-focus / re-open layer). |
 | `menubar.py`              | The macOS menu-bar app. Reuses `monitor.py`'s loading + focus logic. |
+| `traybar.py`              | The Windows tray app: badge icon, toast notifications, auto-resume. Reuses `monitor.py`'s loading + focus logic. |
+| `winplat.py`              | Windows platform layer: claude-process identity, window focus, console input injection. |
 | `history.py`              | Recently-closed project store (load / record). Shared by `hook.py` and `monitor.py`. |
 | `~/.adhd/state/`          | One JSON file per live session (override with `ADHD_STATE_DIR`). |
 | `~/.adhd/history.json`    | The last 10 closed projects, for re-opening (survives restarts/power loss). |
