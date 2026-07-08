@@ -52,9 +52,11 @@ matter — the same table as macOS below: ✅ *project* — done when a turn
 finishes, 🔴 *project* needs you on a permission prompt (with 10-minute repeat
 reminders), 🟣 rate-limited. Toasts play a sound — the needs-you ones a more
 distinctive chime (set `ADHD_NOTIFY_SOUND=0` for visual-only) — and also land
-in the Action Center, so a banner you missed isn't gone. **Clicking a toast focuses the waiting session's
-window** — toasts launch the per-user `adhd:` URL protocol (registered in HKCU
-on tray startup), which is the Windows analogue of the macOS notifier applet.
+in the Action Center, so a banner you missed isn't gone. **Clicking a toast
+focuses the exact session it came from** — each toast's launch URL carries the
+session id (`adhd:focus/<id>`, a per-user protocol registered in HKCU on tray
+startup), so unlike the macOS applet the click doesn't have to guess which
+waiting session you meant.
 
 Where macOS anchors a session to its tty, Windows anchors it to the **claude
 process itself**: the hook records the claude pid (+ creation time, so a

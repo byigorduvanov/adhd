@@ -190,9 +190,13 @@ def _toast_safe(s):
     return s.replace("$", "＄")  # fullwidth: reads the same, inert in PS
 
 
-def notify(title, message, sound="default"):
-    """Show a Windows toast that, when clicked, focuses the neediest session.
+def notify(title, message, sound="default", sid=""):
+    """Show a Windows toast; clicking it focuses the session it came from.
 
+    The toast's launch URL carries the session id (adhd:focus/<sid>), so the
+    protocol handler can jump to that exact window — unlike macOS, where a
+    banner can't address a specific session and the click lands on the
+    neediest one. Without a sid the click falls back to neediest-first.
     `sound` is "default" or "urgent" (needs-you prompts). winotify posts
     through a hidden PowerShell; the toast lands in the Action Center too, so
     a banner you miss isn't gone. Failures are swallowed — a broken toast
@@ -202,7 +206,8 @@ def notify(title, message, sound="default"):
         from winotify import Notification, audio
         toast = Notification(
             app_id=APP_ID, title=_toast_safe(title), msg=_toast_safe(message),
-            icon=ensure_toast_icon(), launch="adhd:focus")
+            icon=ensure_toast_icon(),
+            launch="adhd:focus" + ("/" + sid if sid else ""))
         if SOUND_ENABLED:
             toast.set_audio(audio.IM if sound == "urgent" else audio.Default,
                             loop=False)
@@ -392,17 +397,18 @@ class AdhdTray:
             detail = s.get("detail") or ""
             if st == "waiting" and prev != "waiting":
                 notify("🔴 %s needs you" % proj, detail or "waiting for approval",
-                       sound="urgent")
+                       sound="urgent", sid=sid)
                 self.last_notified[sid] = now
             elif st == "limit" and prev != "limit":
                 notify("🟣 %s rate-limited" % proj,
-                       detail or "waiting for usage limit to reset")
+                       detail or "waiting for usage limit to reset", sid=sid)
             elif st == "idle" and prev == "working":
-                notify("✅ %s — done" % proj, detail or "turn finished")
+                notify("✅ %s — done" % proj, detail or "turn finished", sid=sid)
             elif (st == "waiting" and self.repeat_enabled
                   and now - self.last_notified.get(sid, now) >= REPEAT_AFTER):
                 notify("🔴 %s still needs you" % proj,
-                       detail or "still waiting for approval", sound="urgent")
+                       detail or "still waiting for approval",
+                       sound="urgent", sid=sid)
                 self.last_notified[sid] = now
         for sid in list(self.prev_state):
             if sid not in seen:
@@ -437,7 +443,8 @@ class AdhdTray:
                 rec["tries"] += 1
                 if rec["tries"] == 1:
                     notify("↩️ %s — resuming" % (s.get("project") or "?"),
-                           "sent “%s” to clear the limit" % RESUME_TEXT)
+                           "sent “%s” to clear the limit" % RESUME_TEXT,
+                           sid=sid)
         for sid in list(self.limited):
             if sid not in seen:
                 del self.limited[sid]
@@ -509,21 +516,40 @@ class AdhdTray:
         return cb
 
 
-def focus_waiting():
-    """Focus the session most in need of attention, then exit.
+def _sid_from_url(url):
+    """The session id carried by an adhd:focus/<sid> protocol URL, or ''.
 
-    Invoked as `traybar.py --focus [adhd:...]` when a toast is clicked (via the
-    adhd: protocol). load_sessions() already sorts waiting-first, then
-    most-recent, so the first row is the right target.
+    Tolerates `adhd://focus/<sid>` too — shell components sometimes normalize
+    a scheme to the double-slash form before handing it to the handler.
+    """
+    rest = url.split(":", 1)[-1].lstrip("/")
+    if rest.startswith("focus"):
+        return rest[len("focus"):].strip("/")
+    return ""
+
+
+def focus_waiting(sid=""):
+    """Focus the toast's own session (by sid), then exit.
+
+    Invoked as `traybar.py --focus <adhd:focus/sid>` when a toast is clicked
+    (via the adhd: protocol). If that session is gone — or the toast predates
+    sid-carrying URLs — fall back to the neediest one: load_sessions() sorts
+    waiting-first, then most-recent, so the first row is the best guess.
     """
     sessions = load_sessions()
-    if sessions:
-        focus_session(sessions[0])
+    if not sessions:
+        return
+    target = next(
+        (s for s in sessions if sid and s.get("session_id") == sid), None)
+    focus_session(target or sessions[0])
 
 
 def main():
-    if "--focus" in sys.argv[1:]:
-        focus_waiting()
+    args = sys.argv[1:]
+    if "--focus" in args:
+        sid = next((_sid_from_url(a) for a in args
+                    if a.startswith("adhd:")), "")
+        focus_waiting(sid)
         return
     # One tray only: the Run key + a manual adhd-menu would otherwise run two,
     # each toasting every transition and double-injecting auto-resume text.
