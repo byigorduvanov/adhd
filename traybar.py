@@ -58,6 +58,12 @@ except ValueError:
     REPEAT_AFTER = 600.0  # 10 minutes
 RESUME_DEFAULT = os.environ.get("ADHD_AUTO_RESUME", "0") == "1"
 RESUME_TEXT = os.environ.get("ADHD_RESUME_TEXT", "continue")
+# Toast sound. winotify defaults every toast to SILENT unless an <audio>
+# element is set, so skipping this would make notifications mute. "urgent"
+# (the needs-you prompts) gets a more distinctive chime than the rest — the
+# macOS app makes the same split with its "Funk" sound. ADHD_NOTIFY_SOUND=0
+# keeps the toasts but drops the audio.
+SOUND_ENABLED = os.environ.get("ADHD_NOTIFY_SOUND", "1") != "0"
 try:
     RESUME_AFTER = max(10.0, float(os.environ.get("ADHD_AUTO_RESUME_SECS", "300")))
 except ValueError:
@@ -184,18 +190,22 @@ def _toast_safe(s):
     return s.replace("$", "＄")  # fullwidth: reads the same, inert in PS
 
 
-def notify(title, message):
+def notify(title, message, sound="default"):
     """Show a Windows toast that, when clicked, focuses the neediest session.
 
-    winotify posts through a hidden PowerShell; the toast lands in the Action
-    Center too, so a banner you miss isn't gone. Failures are swallowed — a
-    broken toast pipeline must never take the tray loop down with it.
+    `sound` is "default" or "urgent" (needs-you prompts). winotify posts
+    through a hidden PowerShell; the toast lands in the Action Center too, so
+    a banner you miss isn't gone. Failures are swallowed — a broken toast
+    pipeline must never take the tray loop down with it.
     """
     try:
-        from winotify import Notification
+        from winotify import Notification, audio
         toast = Notification(
             app_id=APP_ID, title=_toast_safe(title), msg=_toast_safe(message),
             icon=ensure_toast_icon(), launch="adhd:focus")
+        if SOUND_ENABLED:
+            toast.set_audio(audio.IM if sound == "urgent" else audio.Default,
+                            loop=False)
         toast.show()
     except Exception:
         pass
@@ -381,7 +391,8 @@ class AdhdTray:
             proj = s.get("project") or "?"
             detail = s.get("detail") or ""
             if st == "waiting" and prev != "waiting":
-                notify("🔴 %s needs you" % proj, detail or "waiting for approval")
+                notify("🔴 %s needs you" % proj, detail or "waiting for approval",
+                       sound="urgent")
                 self.last_notified[sid] = now
             elif st == "limit" and prev != "limit":
                 notify("🟣 %s rate-limited" % proj,
@@ -391,7 +402,7 @@ class AdhdTray:
             elif (st == "waiting" and self.repeat_enabled
                   and now - self.last_notified.get(sid, now) >= REPEAT_AFTER):
                 notify("🔴 %s still needs you" % proj,
-                       detail or "still waiting for approval")
+                       detail or "still waiting for approval", sound="urgent")
                 self.last_notified[sid] = now
         for sid in list(self.prev_state):
             if sid not in seen:
