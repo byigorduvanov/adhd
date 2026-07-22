@@ -65,12 +65,17 @@ whose process is gone, and jumping to a session raises the window that hosts
 that pid — a classic console directly, Windows Terminal via its top-level
 window. **VS Code gets exact-*tab* precision** through a tiny bundled extension
 (`vscode-extension/`, sideloaded for you by `install.py`): integrated terminals
-aren't OS windows, so no Win32 call can pick one — but the tray raises the right
-window and then hands VS Code a `vscode://adhd.focus/term?shellPid=<pid>` URL,
-and the extension reveals the integrated-terminal tab whose shell is that pid.
-So a click lands on the precise tab even when a dozen Claude sessions share one
-window. Run **Developer: Restart Extension Host** (or reload the window) once
-after install to load it; until then the tray still raises the window.
+aren't OS windows, so no Win32 call can pick one. On a click the tray does two
+independent things — it brings the session's **window** frontmost by matching
+the workspace folder in its title (all VS Code windows share one process, so a
+pid can't tell them apart), and it writes a small `~/.adhd/focus-request.json`
+that **every** VS Code window watches; the window whose integrated terminal has
+that shell pid reveals its **tab**. A watched file is used instead of a
+`vscode://` URL because VS Code delivers such URLs to the *focused* window —
+usually not the session's in a multi-window setup — so the click would silently
+do nothing. Reload each VS Code window once after install to start the watcher
+(new windows pick it up automatically); until then the tray still raises the
+correct window.
 
 **Auto-resume** on Windows types via `WriteConsoleInput` into the claude
 process's *own console input buffer* — it targets the process, not a window, so
@@ -235,7 +240,7 @@ how each session was launched and the dashboard picks the best focus method:
 | **iTerm2** | AppleScript match on `ITERM_SESSION_ID` | exact tab/session |
 | **Terminal.app** | AppleScript match on the tab's `tty` | exact tab |
 | **VS Code** (macOS) | `code <project-root>` focuses the window that has that folder open | exact window |
-| **VS Code** (Windows) | raise the pid's window, then the `adhd.focus` extension reveals the tab via `vscode://adhd.focus/term?shellPid=<pid>` | exact tab |
+| **VS Code** (Windows) | raise the session's window by its title, then the `adhd.focus` extension reveals the tab whose shell pid matches a watched `~/.adhd/focus-request.json` | exact tab |
 | other | activates the app (can't target the exact pane) | app only |
 
 The result of each jump is shown just above the footer. Sessions that were
@@ -254,12 +259,19 @@ restart them (or just let them fire one more event) and they'll become jumpable.
 > **On Windows** a session is usually a *terminal tab* inside a shared VS Code
 > window, and integrated terminals aren't OS windows — so `code <folder>` can
 > only raise the window, never pick the tab. The bundled `adhd.focus` extension
-> closes that gap: the tray raises the pid's window, then fires
-> `vscode://adhd.focus/term?shellPid=<pid>` and the extension calls
-> `terminal.show()` on the tab whose shell process is `<pid>` (the parent of the
-> session's `claude`, i.e. exactly `Terminal.processId`). `install.py` sideloads
-> it into `~/.vscode/extensions`; run **Developer: Restart Extension Host** once
-> to load it. Without it, focusing still raises the correct window.
+> closes that gap. On a click the tray (1) brings the session's **window** to
+> the front by matching its workspace folder in the window title — all VS Code
+> windows share one process, so a pid can't distinguish them — and (2) writes
+> `~/.adhd/focus-request.json` (`{shellPid, ts}`), which **every** VS Code window
+> watches; the window whose integrated terminal has that shell pid (the parent of
+> the session's `claude`, i.e. exactly `Terminal.processId`) calls
+> `terminal.show()` on it. The watched file replaces the older
+> `vscode://adhd.focus` URL: VS Code routes such URLs to the *focused* window,
+> which in a multi-window setup usually isn't the session's, so the tab switch
+> silently missed. `install.py` sideloads the extension into
+> `~/.vscode/extensions`; reload each VS Code window once to start its watcher
+> (new windows pick it up automatically). Without it, focusing still raises the
+> correct window.
 
 ### Recently closed (history)
 
@@ -324,8 +336,8 @@ Event → state mapping (in `hook.py`):
 | `monitor.py`              | The terminal dashboard (also the shared session-loading / window-focus / re-open layer). |
 | `menubar.py`              | The macOS menu-bar app. Reuses `monitor.py`'s loading + focus logic. |
 | `traybar.py`              | The Windows tray app: badge icon, toast notifications, auto-resume. Reuses `monitor.py`'s loading + focus logic. |
-| `winplat.py`              | Windows platform layer: claude-process identity, window focus, console input injection, `vscode://` launch. |
-| `vscode-extension/`       | Tiny `adhd.focus` VS Code extension (Windows): a `vscode://` URI handler that reveals the exact integrated-terminal tab of a session. Sideloaded by `install.py`. |
+| `winplat.py`              | Windows platform layer: claude-process identity, window focus (incl. VS Code window-by-title), console input injection. |
+| `vscode-extension/`       | Tiny `adhd.focus` VS Code extension (Windows): watches `~/.adhd/focus-request.json` in every window and reveals the exact integrated-terminal tab of a session (plus a legacy `vscode://` handler). Sideloaded by `install.py`. |
 | `history.py`              | Recently-closed project store (load / record). Shared by `hook.py` and `monitor.py`. |
 | `~/.adhd/state/`          | One JSON file per live session (override with `ADHD_STATE_DIR`). |
 | `~/.adhd/history.json`    | The last 10 closed projects, for re-opening (survives restarts/power loss). |

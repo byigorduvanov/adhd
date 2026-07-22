@@ -279,6 +279,9 @@ if IS_WIN:
     _user32.IsWindowVisible.argtypes = [_P]
     _user32.GetWindowTextLengthW.argtypes = [_P]
     _user32.GetWindowThreadProcessId.argtypes = [_P, _P]
+    _user32.GetForegroundWindow.restype = _P
+    _user32.GetWindowTextW.argtypes = [_P, ctypes.c_wchar_p, ctypes.c_int]
+    _user32.AttachThreadInput.argtypes = [ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int]
 
 SW_RESTORE = 9
 VK_MENU = 0x12
@@ -316,22 +319,83 @@ def acquire_single_instance(name="Local\\adhd-traybar"):
 def _force_foreground(hwnd):
     """SetForegroundWindow with the standard workarounds.
 
-    Windows refuses foreground changes from background processes; the classic
-    escape hatch is a synthetic no-op Alt press (grants our thread the
-    foreground right), plus restoring the window if it's minimized.
+    Windows refuses foreground changes from a background process. Two escape
+    hatches, applied together for reliability: (1) AttachThreadInput ties our
+    thread's input state to the current foreground window's thread (and the
+    target's), so Windows treats our SetForegroundWindow as coming from the
+    foreground; (2) a synthetic no-op Alt press also grants the foreground
+    right. Restores a minimized window first.
     """
     if not hwnd:
         return False
     try:
         if _user32.IsIconic(hwnd):
             _user32.ShowWindow(hwnd, SW_RESTORE)
-        _user32.keybd_event(VK_MENU, 0, 0, 0)
-        ok = bool(_user32.SetForegroundWindow(hwnd))
-        _user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-        _user32.BringWindowToTop(hwnd)
+        our_tid = _kernel32.GetCurrentThreadId()
+        fg = _user32.GetForegroundWindow()
+        fg_tid = _user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        tgt_tid = _user32.GetWindowThreadProcessId(hwnd, None)
+        att_fg = fg_tid and fg_tid != our_tid and bool(
+            _user32.AttachThreadInput(our_tid, fg_tid, True))
+        att_tgt = tgt_tid and tgt_tid not in (our_tid, fg_tid) and bool(
+            _user32.AttachThreadInput(our_tid, tgt_tid, True))
+        try:
+            _user32.keybd_event(VK_MENU, 0, 0, 0)
+            _user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+            _user32.BringWindowToTop(hwnd)
+            ok = bool(_user32.SetForegroundWindow(hwnd))
+        finally:
+            if att_tgt:
+                _user32.AttachThreadInput(our_tid, tgt_tid, False)
+            if att_fg:
+                _user32.AttachThreadInput(our_tid, fg_tid, False)
         return ok
     except Exception:
         return False
+
+
+def _find_vscode_window(name):
+    """HWND of the visible VS Code window for workspace folder `name`, or 0.
+
+    VS Code's title is '<file> - <folder> - Visual Studio Code' (or
+    '<folder> - Visual Studio Code' with no file open), so the workspace folder
+    — a session's project name — sits right before the app-name suffix. All VS
+    Code windows share one process, so this title match is the only way to tell
+    them apart from outside.
+    """
+    needle = ("%s - Visual Studio Code" % name).lower()
+    match = [0]
+    EnumWindowsProc = ctypes.WINFUNCTYPE(
+        ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def cb(hwnd, _):
+        if not _user32.IsWindowVisible(hwnd):
+            return True
+        n = _user32.GetWindowTextLengthW(hwnd)
+        if n == 0:
+            return True
+        buf = ctypes.create_unicode_buffer(n + 1)
+        _user32.GetWindowTextW(hwnd, buf, n + 1)
+        if needle in buf.value.lower():
+            match[0] = hwnd
+            return False  # stop enumerating
+        return True
+
+    _user32.EnumWindows(EnumWindowsProc(cb), 0)
+    return match[0]
+
+
+def focus_vscode_window_by_title(name):
+    """Bring the VS Code window for workspace folder `name` to the front.
+
+    Runs in-process (pure Win32 window calls, no console attach needed), so the
+    tray/toast-click handler can call it directly. False when no window matches
+    or the raise is refused.
+    """
+    if not (IS_WIN and name):
+        return False
+    hwnd = _find_vscode_window(name)
+    return bool(hwnd) and _force_foreground(hwnd)
 
 
 def _attach(pid):

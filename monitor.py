@@ -43,6 +43,10 @@ ADHD_HOME = os.path.dirname(STATE_DIR)  # ~/.adhd
 # It lets the menu bar focus an already-open dashboard instead of spawning a
 # second one. See write_dashboard_lock() / dashboard_session().
 DASHBOARD_LOCK = os.path.join(ADHD_HOME, "dashboard.json")
+# Toast-click focus signal for the bundled adhd.focus VS Code extension. The
+# tray writes {shellPid, ts} here; every VS Code window watches it and the one
+# owning that shell reveals its terminal tab. See focus_vscode_session().
+FOCUS_REQUEST = os.path.join(ADHD_HOME, "focus-request.json")
 REFRESH = 1.0          # seconds between redraws
 STALE_AFTER = 6 * 3600  # entries older than this are pruneable with 'c'
 
@@ -357,31 +361,56 @@ def focus_vscode_window(root, project):
     return "`code` CLI failed to run"
 
 
+def _write_focus_request(shell):
+    """Signal every VS Code window to reveal the terminal tab whose shell is
+    `shell`. Only the window that owns it reacts — routing-free, unlike a
+    vscode:// URI (which VS Code delivers to the *focused* window, not the
+    terminal's owner, so in a multi-window setup it usually misses). Atomic
+    write so a watcher never reads a half-written file. True on success."""
+    try:
+        os.makedirs(ADHD_HOME, exist_ok=True)
+        tmp = FOCUS_REQUEST + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"shellPid": int(shell), "ts": time.time()}, f)
+        os.replace(tmp, FOCUS_REQUEST)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def focus_vscode_session(s):
     """Focus the exact VS Code terminal *tab* running session `s` (Windows).
 
-    A Claude session is an integrated-terminal tab, not a window, so two moves:
-      1. raise the VS Code window hosting the session's claude process — this
-         also makes it the topmost window, which is the one VS Code routes the
-         next step to in a multi-window setup; then
-      2. hand VS Code `vscode://adhd.focus/term?shellPid=<pid>` so the companion
-         extension reveals the tab whose shell is <pid>. That shell is the
-         parent of the claude process — exactly what Terminal.processId reports.
+    A Claude session is an integrated-terminal tab, not a window, and VS Code
+    spreads tabs across windows that all share one OS process — so two
+    independent moves:
+      1. TAB — write a focus-request the bundled adhd.focus extension watches in
+         every window; only the window owning the target shell reveals its tab.
+         Routing-free (a vscode:// URI lands on the focused window, which in a
+         multi-window setup usually isn't the session's).
+      2. WINDOW — bring that window frontmost by matching its title (all VS Code
+         windows share one pid, so pid-based focus can't tell them apart; the
+         title carries the workspace folder = the session's project).
 
-    Degrades honestly: window-only when the extension is absent/not-yet-loaded,
-    then folder-based focus when no pid was captured (restart the session).
+    Degrades honestly: window-only when the extension isn't loaded yet, and
+    folder-based focus when neither pid nor a matching window is available.
     """
     term = s.get("term") or {}
     proj = s.get("project") or "session"
     cpid = term.get("claude_pid") or 0
-    raised = bool(cpid) and winplat.focus_pid(cpid)
     shell = winplat.parent_pid(cpid) if cpid else 0
-    if shell and winplat.vscode_focus_ext_installed():
-        if winplat.open_uri("vscode://adhd.focus/term?shellPid=%d" % shell):
-            return "focused %s terminal" % proj
-    if raised:
-        return ("raised the VS Code window for %s — install the adhd.focus "
-                "extension and reload VS Code to land on the exact tab" % proj)
+
+    tab = (bool(shell) and winplat.vscode_focus_ext_installed()
+           and _write_focus_request(shell))
+    win = winplat.focus_vscode_window_by_title(proj) if proj else False
+    if not win and cpid:
+        win = winplat.focus_pid(cpid)  # fallback: raise *some* VS Code window
+
+    if tab and win:
+        return "focused %s terminal" % proj
+    if win:
+        return ("raised the VS Code window for %s — reload VS Code once so the "
+                "adhd.focus extension can switch to the exact tab" % proj)
     root = term.get("root") or s.get("cwd") or ""
     return focus_vscode_window(root, s.get("project") or "")
 

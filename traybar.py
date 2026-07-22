@@ -539,9 +539,16 @@ def focus_waiting(sid=""):
     sessions = load_sessions()
     if not sessions:
         return
-    target = next(
-        (s for s in sessions if sid and s.get("session_id") == sid), None)
-    focus_session(target or sessions[0])
+    if sid:
+        target = next(
+            (s for s in sessions if s.get("session_id") == sid), None)
+        if target:
+            focus_session(target)
+        # else: the toast's session has ended since it fired — do nothing rather
+        # than yank focus to an unrelated busy session. The neediest-first
+        # fallback below is only correct for legacy sid-less toasts.
+        return
+    focus_session(sessions[0])
 
 
 def main():
